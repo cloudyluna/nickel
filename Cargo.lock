@@ -1733,6 +1733,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "nickel-lang-core",
+ "nickel-lang-package",
  "nickel-lang-utils",
  "serde",
  "tempfile",
@@ -1834,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "nickel-lang-package"
-version = "1.6.0"
+version = "0.1.0"
 dependencies = [
  "directories",
  "git2",
