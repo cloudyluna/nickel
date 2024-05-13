@@ -729,8 +729,19 @@ ExtendedIdent: LocIdent = {
     <Ident>,
 };
 
-Ident: LocIdent = <l:@L> <i: "identifier"> <r:@R> =>
-    LocIdent::new_with_pos(i, mk_pos(src_id, l, r));
+// Tokens that must be lexed separately because they are keywords in some
+// specific contexts, but aren't ambiguous otherwise, and can in particular be
+// used as identifiers without any issue.
+ContextualKeyword: Ident = {
+    "or" => Ident::from("or"),
+};
+
+Ident: LocIdent = {
+    <left :@L> <id: "identifier"> <right :@R> =>
+        LocIdent::new_with_pos(id, mk_pos(src_id, left, right)),
+    <left: @L> <id: ContextualKeyword> <right: @R> =>
+        LocIdent::new_with_pos(id, mk_pos(src_id, left, right)),
+};
 
 Bool: bool = {
     "true" => true,

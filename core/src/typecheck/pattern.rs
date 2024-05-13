@@ -390,6 +390,9 @@ impl PatternTypes for PatternData {
             PatternData::Constant(constant_pat) => {
                 constant_pat.pattern_types_inj(pt_state, path, state, ctxt, mode)
             }
+            PatternData::OrPattern(or_pat) => {
+                or_pat.pattern_types_inj(pt_state, path, state, ctxt, mode)
+            }
         }
     }
 }
@@ -520,5 +523,83 @@ impl PatternTypes for EnumPattern {
             id: self.tag,
             typ: typ_arg,
         })
+    }
+}
+
+impl PatternTypes for OrPattern {
+    type PatType = UnifType;
+
+    fn pattern_types_inj(
+        &self,
+        pt_state: &mut PatTypeState,
+        path: PatternPath,
+        state: &mut State,
+        ctxt: &Context,
+        mode: TypecheckMode,
+    ) -> Result<Self::PatType, TypecheckError> {
+        // When checking a sequence of disjuncts, we must combine their open tails and wildcard
+        // pattern positions - in fact, when typechecking a whole match expression, this is exactly
+        // what the typechecker is doing: it merges them. However, for bindings, we must ensure
+        // that:
+        //
+        // 1. They are the same
+        // 2. They have the same type
+        //
+        // To do so, we call to pattern_types_inj with a fresh vector of bindings, so that we can
+        // pre-process them afterward and before finally adding them to the original overall
+        // bindings.
+
+        let bindings: Result<Vec<_>> = self
+            .patterns
+            .iter()
+            .map(|pat| {
+                let mut fresh_bindings = Vec::new();
+
+                let local_state = PatTypeState {
+                    bindings: &mut fresh_bindings,
+                    enum_open_tails: pt_state.enum_open_tails,
+                    wildcard_pat_paths: pt_state.wildcard_pat_paths,
+                };
+
+                let typ = pat.pattern_types_inj(&mut local_state, path.clone(), state, ctxt, mode)?;
+
+                fresh_bindings.sort();
+                Ok((typ, fresh_bindings))
+            })
+            .collect();
+
+        let mut it = bindings?.into_iterator();
+
+        let Some(model) = it.first() else {
+            // We should never generate empty `or` sequences (it's not possible in the source
+            // language, at least). However, it doesn't cost much to support them: such a pattern
+            // never matchs anything. Thus, we return the bottom type encoded as `forall a. a`. 
+            let free_var = Ident::from("a");
+            return Ok(UnifType::concrete(TypeF::Forall {var: free_var.into(), var_kind: VarKind::Type, body: UnifType::concrete(TypeF::Var(free_var)) }));
+        };
+
+        for (typ, pat_bindings) in bindings {
+            if model.len() != bindings.len() {
+                return Err(todo!());
+            }
+
+            for idx in 0..model.len() {
+                let (model_id, model_ty) = model[idx];
+                let (id, ty) = pat_bindings[idx];
+
+                if model_id != id {
+                    return Err(todo!());
+                }
+
+                if let TypecheckMode::Enforce = mode {
+                  model_ty 
+                    .clone()
+                    .unify(ty, state, ctxt)
+                    .map_err(|e| e.into_typecheck_err(state, self.pos))?;
+                }
+            }
+        }
+
+        
     }
 }
