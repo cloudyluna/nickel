@@ -142,7 +142,10 @@ pub enum ConstantPatternData {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct OrPattern { pub patterns: Vec<Pattern> }
+pub struct OrPattern {
+    pub patterns: Vec<Pattern>,
+    pub pos: TermPos,
+}
 
 /// The tail of a data structure pattern (record or array) which might capture the rest of said
 /// data structure.

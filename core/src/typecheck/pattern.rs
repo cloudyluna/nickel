@@ -537,18 +537,21 @@ impl PatternTypes for OrPattern {
         ctxt: &Context,
         mode: TypecheckMode,
     ) -> Result<Self::PatType, TypecheckError> {
-        // When checking a sequence of disjuncts, we must combine their open tails and wildcard
+        // When checking a sequence of or patterns, we must combine their open tails and wildcard
         // pattern positions - in fact, when typechecking a whole match expression, this is exactly
-        // what the typechecker is doing: it merges them. However, for bindings, we must ensure
-        // that:
+        // what the typechecker is doing: it merges all those data. And a match expression is,
+        // similarly to an or pattern, a disjunction.
         //
-        // 1. They are the same
-        // 2. They have the same type
+        // However, the treatment of bindings is different. If any of the disjuncts in an
+        // or-pattern matches, the same code path (match branch) will be run, and thus they must
+        // agree on pattern variables. In particular, we must ensure that:
         //
-        // To do so, we call to pattern_types_inj with a fresh vector of bindings, so that we can
-        // pre-process them afterward and before finally adding them to the original overall
-        // bindings.
-
+        // 1. All pattern branches have the same set of variables
+        // 2. Each variable has a compatible type in every or-pattern branch
+        //
+        // To do so, we call to `pattern_types_inj` with a fresh vector of bindings, so that we can
+        // post-process them afterward (enforcing 1. and 2. above) before actually adding them to
+        // the original overall bindings.
         let bindings: Result<Vec<_>> = self
             .patterns
             .iter()
@@ -561,45 +564,90 @@ impl PatternTypes for OrPattern {
                     wildcard_pat_paths: pt_state.wildcard_pat_paths,
                 };
 
-                let typ = pat.pattern_types_inj(&mut local_state, path.clone(), state, ctxt, mode)?;
+                let typ =
+                    pat.pattern_types_inj(&mut local_state, path.clone(), state, ctxt, mode)?;
 
-                fresh_bindings.sort();
+                // We sort the bindings to check later that they are the same in all branches
+                fresh_bindings.sort_by_key(|(id, _typ)| id);
                 Ok((typ, fresh_bindings))
             })
             .collect();
 
         let mut it = bindings?.into_iterator();
 
-        let Some(model) = it.first() else {
-            // We should never generate empty `or` sequences (it's not possible in the source
-            // language, at least). However, it doesn't cost much to support them: such a pattern
-            // never matchs anything. Thus, we return the bottom type encoded as `forall a. a`. 
+        // We need a reference set of variables (and their types for unification). We just pick the
+        // first bindings of the list.
+        let Some((model_typ, model)) = it.first() else {
+            // We should never generate empty `or` sequences (it's not possible to write them in
+            // the source language, at least). However, it doesn't cost much to support them: such
+            // a pattern never matches anything. Thus, we return the bottom type encoded as `forall
+            // a. a`.
             let free_var = Ident::from("a");
-            return Ok(UnifType::concrete(TypeF::Forall {var: free_var.into(), var_kind: VarKind::Type, body: UnifType::concrete(TypeF::Var(free_var)) }));
+
+            return Ok(UnifType::concrete(TypeF::Forall {
+                var: free_var.into(),
+                var_kind: VarKind::Type,
+                body: UnifType::concrete(TypeF::Var(free_var)),
+            }));
         };
 
         for (typ, pat_bindings) in bindings {
-            if model.len() != bindings.len() {
-                return Err(todo!());
+            if model.len() != pat_bindings.len() {
+                // We need to arbitrary choose a variable to report. We take the last one of the
+                // longest list, which is guaranteed to not be present in all branches
+                let witness = if model.len() > pat_bindings.len() {
+                    // unwrap(): model.len() > pat_bindings.len() >= 0
+                    model.last().unwrap().0
+                } else {
+                    // unwrap(): model.len() <= pat_bindings.len() and (by the outer-if)
+                    // pat_bindings.len() != mode.len(), so:
+                    // 0 <= model.len() < pat_bindings.len()
+                    pat_bindings.last().unwrap().0
+                };
+
+                return Err(TypecheckError::OrPatternVarsMismatch {
+                    var: witness,
+                    pos: self.pos,
+                });
             }
 
+            // We unify the type of the first or-branch with the current or-branch, to make sure
+            // all the subpatterns are matching values of the same type
+            if let TypecheckMode::Enforce = mode {
+                model_typ
+                    .clone()
+                    .unify(typ, state, ctxt)
+                    .map_err(|e| e.into_typecheck_err(state, self.pos))?;
+            }
+
+            // Finally, we unify the type of the bindings
             for idx in 0..model.len() {
                 let (model_id, model_ty) = model[idx];
                 let (id, ty) = pat_bindings[idx];
 
                 if model_id != id {
-                    return Err(todo!());
+                    // Once again, we must arbitrarily pick a variable to report (indeed, here both
+                    // `model_id` and `id` aren't present in all branches)
+                    return Err(TypecheckError::OrPatternVarsMismatch {
+                        var: model_id,
+                        pos: self.pos,
+                    });
                 }
 
                 if let TypecheckMode::Enforce = mode {
-                  model_ty 
-                    .clone()
-                    .unify(ty, state, ctxt)
-                    .map_err(|e| e.into_typecheck_err(state, self.pos))?;
+                    model_ty
+                        .clone()
+                        .unify(ty, state, ctxt)
+                        .map_err(|e| e.into_typecheck_err(state, self.pos))?;
                 }
             }
         }
 
-        
+        // Once we have checked that all the bound variables are the same and we have unified their
+        // types, we can add them to the overall bindings (since they are unified, it doesn't
+        // matter which type we use - so we just reuse the model, which is still around)
+        pt_state.bindings.extend(model);
+
+        Ok(model_typ)
     }
 }
