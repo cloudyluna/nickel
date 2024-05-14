@@ -520,18 +520,20 @@ FieldPathElem: FieldPathElem = {
 
 // A pattern.
 //
+// # Flavour
+//
 // The PatternF, PatternDataF and EnumPatternF rules are parametrized by a
 // (string) flag (using LALRPOP's undocumented conditional macros). The idea is
 // that those rules have two flavours: the most general one, which allow
 // patterns to be unrestricted, and a version for function arguments.
 //
-// The issue is the following: before the introduction of enum variants,
-// functions have been allowed to match on several arguments using a sequence of
-// patterns. For example, `fun {x} {y} z => x + y + z`. With variants, we've
-// added the following pattern form: `'SomeTag argument`. Now, something like
-// `fun 'SomeTag 'SomeArg => ...` is ambiguous: are we matching on a single
-// argument that we expect to be `('SomeTag 'SomeArg)`, or on two separate
-// arguments that are bare enum tags, as in `fun ('SomeTag) ('SomeArg)`?
+// Before the introduction of enum variants, functions have been allowed to
+// match on several arguments using a sequence of patterns. For example, `fun
+// {x} {y} z => x + y + z`. With variants, we've added the following pattern
+// form: `'SomeTag argument`. Now, something like `fun 'SomeTag 'SomeArg => ...`
+// is ambiguous: are we matching on a single argument that we expect to be
+// `('SomeTag 'SomeArg)`, or on two separate arguments that are bare enum tags,
+// as in `fun ('SomeTag) ('SomeArg)`?
 //
 // To avoid ambiguity, we force the top-level argument patterns of a function to
 // use a parenthesized version for enum variants. Thus `fun 'Foo 'Bar => ...` is
@@ -545,12 +547,24 @@ FieldPathElem: FieldPathElem = {
 // readability. In practice, this means that the argument pattern of an enum
 // variant pattern has the same restriction as a function argument pattern.
 //
-// The flavour parameter `F` can either be `"function"`, which is disabling the
-// non-parenthesized enum variant rule, or any other string for the general
-// flavour. In practice we use "".
+// The flavour parameter `Flavour` can either be `"restricted"`, which is
+// disabling the non-parenthesized enum variant rule, or any other string for
+// the general flavour. In practice we use "unrestricted".
+//
+// ## Addendum: `or` patterns
+//
+// This parameter now extends to `or` patterns, which are also ambiguous when
+// used as function arguments. As `or` is a valid identifier, `fun x or y =>
+// ...` could be a function of 3 arguments `x`, `or` and `y` or of one argument
+// matching the pattern `(x or y)` (this isn't a valid or-pattern because the
+// bound variables are different in each or branch, but that's beside the point
+// - checking variable mismatches isn't the job of parsing rules).
+//
+// We thus reuse the exact same idea in order to force or-patterns used at the
+// top-level of a function argument to be parenthesized.
 #[inline]
-PatternF<F>: Pattern = {
-    <l: @L> <alias:(<Ident> "@")?> <data: PatternDataF<F>> <r: @R> => {
+PatternF<Flavour>: Pattern = {
+    <l: @L> <alias:(<Ident> "@")?> <data: PatternDataF<Flavour>> <r: @R> => {
         Pattern {
            alias,
            data,
@@ -560,21 +574,23 @@ PatternF<F>: Pattern = {
 };
 
 #[inline]
-PatternDataF<F>: PatternData = {
+PatternDataF<Flavour>: PatternData = {
     RecordPattern => PatternData::Record(<>),
     ArrayPattern => PatternData::Array(<>),
     ConstantPattern => PatternData::Constant(<>),
-    EnumPatternF<F> => PatternData::Enum(<>),
+    EnumPatternF<Flavour> => PatternData::Enum(<>),
+    OrPatternF<Flavour> => PatternData::Or(<>),
     Ident => PatternData::Any(<>),
     "_" => PatternData::Wildcard,
 };
 
 // A general pattern.
 #[inline]
-Pattern: Pattern = PatternF<"">;
+Pattern: Pattern = PatternF<"unrestricted">;
 
 // A pattern restricted to function arguments.
-PatternFun: Pattern = PatternF<"function">;
+#[inline]
+PatternFun: Pattern = PatternF<"restricted">;
 
 ConstantPattern: ConstantPattern = {
     <start: @L> <data: ConstantPatternData> <end: @R> => ConstantPattern {
@@ -646,25 +662,53 @@ ArrayPattern: ArrayPattern = {
     },
 };
 
-EnumPatternF<F>: EnumPattern = {
+EnumPatternF<Flavour>: EnumPattern = {
     <start: @L> <tag: EnumTag> <end: @R> => EnumPattern {
         tag,
         pattern: None,
         pos: mk_pos(src_id, start, end),
     },
-    // See documentation of PatternF to see why we use the "function" variant
+    // See documentation of PatternF to see why we use the "restricted" variant
     // here.
-    <start: @L> <tag: EnumTag> <pattern: PatternF<"function">> <end: @R> if F != "function" => EnumPattern {
+    <start: @L> <tag: EnumTag> <pattern: PatternF<"restricted">> <end: @R>
+        if Flavour != "restricted" => EnumPattern {
         tag,
         pattern: Some(Box::new(pattern)),
         pos: mk_pos(src_id, start, end),
     },
-    <start: @L> "(" <tag: EnumTag> <pattern: PatternF<"function">> ")" <end: @R> => EnumPattern {
+    <start: @L> "(" <tag: EnumTag> <pattern: PatternF<"restricted">> ")" <end: @R> => EnumPattern {
         tag,
         pattern: Some(Box::new(pattern)),
         pos: mk_pos(src_id, start, end),
     },
 };
+
+OrPatternF<Flavour>: OrPattern = {
+    // We use the restricted version of the pattern rule for subpatterns here.
+    // The idea is to avoid ambiguities: for example, without restriction, `<p>
+    // or <q> or <r>` could be parsed either as `Or[Or[<p,<q>],<r>]`, `Or[<p>,
+    // Or[<q>,<r>]]`, or `Or[<p>, <q>, <r>]`. Secondly, this also doesn't play
+    // very well with unparenthesized enum patterns [TODO: not exactly true].
+    <start: @L> <fst: PatternF<"restricted">>
+      <patterns: ("or" <PatternF<"restricted">>)+> <end: @R>
+      if Flavour != "restricted" => {
+        let patterns = std::iter::once(fst).chain(patterns).collect();
+
+        OrPattern {
+            patterns,
+            pos: mk_pos(src_id, start, end),
+        }
+    },
+    "(" <start: @L> <fst: PatternF<"restricted">>
+      <patterns: ("or" <PatternF<"restricted">>)+> <end: @R> ")" => {
+        let patterns = std::iter::once(fst).chain(patterns).collect();
+
+        OrPattern {
+            patterns,
+            pos: mk_pos(src_id, start, end),
+        }
+    },
+}
 
 // A binding `ident = <pattern>` inside a record pattern.
 FieldPattern: FieldPattern = {
@@ -732,15 +776,14 @@ ExtendedIdent: LocIdent = {
 // Tokens that must be lexed separately because they are keywords in some
 // specific contexts, but aren't ambiguous otherwise, and can in particular be
 // used as identifiers without any issue.
-ContextualKeyword: Ident = {
-    "or" => Ident::from("or"),
+ContextualKeyword: LocIdent = {
+    <left: @L> "or" <right: @R> => LocIdent::new_with_pos("or", mk_pos(src_id, left, right)),
 };
 
 Ident: LocIdent = {
     <left :@L> <id: "identifier"> <right :@R> =>
         LocIdent::new_with_pos(id, mk_pos(src_id, left, right)),
-    <left: @L> <id: ContextualKeyword> <right: @R> =>
-        LocIdent::new_with_pos(id, mk_pos(src_id, left, right)),
+    <ContextualKeyword>,
 };
 
 Bool: bool = {
@@ -1266,6 +1309,7 @@ extern {
         "null" => Token::Normal(NormalToken::Null),
         "true" => Token::Normal(NormalToken::True),
         "false" => Token::Normal(NormalToken::False),
+        "or" => Token::Normal(NormalToken::Or),
 
         "?" => Token::Normal(NormalToken::QuestionMark),
         "," => Token::Normal(NormalToken::Comma),

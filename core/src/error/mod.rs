@@ -2528,7 +2528,7 @@ impl IntoDiagnostics<FileId> for TypecheckError {
                     ])]
             }
             TypecheckError::OrPatternVarsMismatch { var, pos } => {
-                let mut labels = vec![primary_alt(var.pos.into_opt(), var.as_str(), files)
+                let mut labels = vec![primary_alt(var.pos.into_opt(), var.into_label(), files)
                     .with_message("this variable must occur in all branches")];
 
                 if let Some(span) = pos.into_opt() {

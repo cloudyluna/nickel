@@ -591,6 +591,7 @@ where
             PatternData::Array(ap) => ap.pretty(allocator),
             PatternData::Enum(evp) => evp.pretty(allocator),
             PatternData::Constant(cp) => cp.pretty(allocator),
+            PatternData::Or(op) => op.pretty(allocator),
         }
     }
 }
@@ -728,6 +729,24 @@ where
         ]
         .nest(2)
         .brackets()
+        .group()
+    }
+}
+
+impl<'a, D, A> Pretty<'a, D, A> for &OrPattern
+where
+    D: NickelAllocatorExt<'a, A>,
+    D::Doc: Clone,
+    A: Clone + 'a,
+{
+    fn pretty(self, allocator: &'a D) -> DocBuilder<'a, D, A> {
+        docs![
+            allocator,
+            allocator.intersperse(
+                self.patterns.iter(),
+                docs![allocator, allocator.line(), "or", allocator.space()],
+            ),
+        ]
         .group()
     }
 }

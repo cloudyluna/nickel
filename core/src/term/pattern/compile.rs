@@ -261,7 +261,7 @@ impl CompilePart for PatternData {
             PatternData::Array(pat) => pat.compile_part(value_id, bindings_id),
             PatternData::Enum(pat) => pat.compile_part(value_id, bindings_id),
             PatternData::Constant(pat) => pat.compile_part(value_id, bindings_id),
-            PatternData::OrPattern(pat) => pat.compile_part(value_id, bindings_id),
+            PatternData::Or(pat) => pat.compile_part(value_id, bindings_id),
         }
     }
 }
@@ -327,16 +327,19 @@ impl CompilePart for OrPattern {
             .iter()
             .fold(Term::Null.into(), |cont, pattern| {
                 let prev_bindings = LocIdent::fresh();
+
                 let is_prev_not_null = make::op1(
-                    UnaryOp::BoolNot,
+                    UnaryOp::BoolNot(),
                     make::op2(BinaryOp::Eq(), Term::Var(prev_bindings), Term::Null),
                 );
 
-                make::if_then_else(
+                let if_block = make::if_then_else(
                     is_prev_not_null,
                     Term::Var(prev_bindings),
                     pattern.compile_part(value_id, bindings_id),
-                )
+                );
+
+                make::let_in(prev_bindings, cont, if_block)
             })
     }
 }

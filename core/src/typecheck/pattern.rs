@@ -390,9 +390,7 @@ impl PatternTypes for PatternData {
             PatternData::Constant(constant_pat) => {
                 constant_pat.pattern_types_inj(pt_state, path, state, ctxt, mode)
             }
-            PatternData::OrPattern(or_pat) => {
-                or_pat.pattern_types_inj(pt_state, path, state, ctxt, mode)
-            }
+            PatternData::Or(or_pat) => or_pat.pattern_types_inj(pt_state, path, state, ctxt, mode),
         }
     }
 }
@@ -540,11 +538,11 @@ impl PatternTypes for OrPattern {
         // When checking a sequence of or patterns, we must combine their open tails and wildcard
         // pattern positions - in fact, when typechecking a whole match expression, this is exactly
         // what the typechecker is doing: it merges all those data. And a match expression is,
-        // similarly to an or pattern, a disjunction.
+        // similarly to an or pattern, a disjunction or patterns.
         //
         // However, the treatment of bindings is different. If any of the disjuncts in an
-        // or-pattern matches, the same code path (match branch) will be run, and thus they must
-        // agree on pattern variables. In particular, we must ensure that:
+        // or-pattern matches, the same code path (the match branch) will be run, and thus they
+        // must agree on pattern variables which requires that:
         //
         // 1. All pattern branches have the same set of variables
         // 2. Each variable has a compatible type in every or-pattern branch
@@ -552,13 +550,13 @@ impl PatternTypes for OrPattern {
         // To do so, we call to `pattern_types_inj` with a fresh vector of bindings, so that we can
         // post-process them afterward (enforcing 1. and 2. above) before actually adding them to
         // the original overall bindings.
-        let bindings: Result<Vec<_>> = self
+        let bindings: Result<Vec<_>, _> = self
             .patterns
             .iter()
-            .map(|pat| {
+            .map(|pat| -> Result<_, TypecheckError> {
                 let mut fresh_bindings = Vec::new();
 
-                let local_state = PatTypeState {
+                let mut local_state = PatTypeState {
                     bindings: &mut fresh_bindings,
                     enum_open_tails: pt_state.enum_open_tails,
                     wildcard_pat_paths: pt_state.wildcard_pat_paths,
@@ -568,16 +566,17 @@ impl PatternTypes for OrPattern {
                     pat.pattern_types_inj(&mut local_state, path.clone(), state, ctxt, mode)?;
 
                 // We sort the bindings to check later that they are the same in all branches
-                fresh_bindings.sort_by_key(|(id, _typ)| id);
+                fresh_bindings.sort_by_key(|(id, _typ)| *id);
+
                 Ok((typ, fresh_bindings))
             })
             .collect();
 
-        let mut it = bindings?.into_iterator();
+        let mut it = bindings?.into_iter();
 
         // We need a reference set of variables (and their types for unification). We just pick the
         // first bindings of the list.
-        let Some((model_typ, model)) = it.first() else {
+        let Some((model_typ, model)) = it.next() else {
             // We should never generate empty `or` sequences (it's not possible to write them in
             // the source language, at least). However, it doesn't cost much to support them: such
             // a pattern never matches anything. Thus, we return the bottom type encoded as `forall
@@ -587,11 +586,11 @@ impl PatternTypes for OrPattern {
             return Ok(UnifType::concrete(TypeF::Forall {
                 var: free_var.into(),
                 var_kind: VarKind::Type,
-                body: UnifType::concrete(TypeF::Var(free_var)),
+                body: Box::new(UnifType::concrete(TypeF::Var(free_var))),
             }));
         };
 
-        for (typ, pat_bindings) in bindings {
+        for (typ, pat_bindings) in it {
             if model.len() != pat_bindings.len() {
                 // We need to arbitrary choose a variable to report. We take the last one of the
                 // longest list, which is guaranteed to not be present in all branches
@@ -621,15 +620,14 @@ impl PatternTypes for OrPattern {
             }
 
             // Finally, we unify the type of the bindings
-            for idx in 0..model.len() {
-                let (model_id, model_ty) = model[idx];
-                let (id, ty) = pat_bindings[idx];
+            for (idx, (id, typ)) in pat_bindings.into_iter().enumerate() {
+                let (model_id, model_ty) = &model[idx];
 
-                if model_id != id {
+                if *model_id != id {
                     // Once again, we must arbitrarily pick a variable to report (indeed, here both
                     // `model_id` and `id` aren't present in all branches)
                     return Err(TypecheckError::OrPatternVarsMismatch {
-                        var: model_id,
+                        var: id,
                         pos: self.pos,
                     });
                 }
@@ -637,7 +635,7 @@ impl PatternTypes for OrPattern {
                 if let TypecheckMode::Enforce = mode {
                     model_ty
                         .clone()
-                        .unify(ty, state, ctxt)
+                        .unify(typ, state, ctxt)
                         .map_err(|e| e.into_typecheck_err(state, self.pos))?;
                 }
             }
