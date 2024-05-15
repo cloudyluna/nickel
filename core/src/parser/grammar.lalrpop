@@ -614,7 +614,7 @@ PatternDataF<EnumRule, OrRule>: PatternData = {
     ArrayPattern => PatternData::Array(<>),
     ConstantPattern => PatternData::Constant(<>),
     EnumRule => PatternData::Enum(<>),
-    OrRule => PatternData::Any(<>),
+    OrRule => PatternData::Or(<>),
     Ident => PatternData::Any(<>),
     "_" => PatternData::Wildcard,
 };
