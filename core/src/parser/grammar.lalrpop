@@ -522,10 +522,18 @@ FieldPathElem: FieldPathElem = {
 //
 // # Flavour
 //
-// The PatternF, PatternDataF and EnumPatternF rules are parametrized by a
-// (string) flag (using LALRPOP's undocumented conditional macros). The idea is
-// that those rules have two flavours: the most general one, which allow
-// patterns to be unrestricted, and a version for function arguments.
+// The PatternF, and in general several pattern rules ending with a capital `F`,
+// are rules parametrized by some of the other rules that can appear inside. In
+// general, depending on where those patterns and subpatterns occur, they need
+// various restrictions to ensure that parsing is never ambiguous (at least with
+// respect to the LALR(1)/LR(1) capabilities supported by LALRPOP).
+//
+// The various flavours of pattern rules and their respective motivation are
+// detailed below.
+//
+// # Parentheses for function arguments
+//
+// ## Enum variants
 //
 // Before the introduction of enum variants, functions have been allowed to
 // match on several arguments using a sequence of patterns. For example, `fun
@@ -547,24 +555,51 @@ FieldPathElem: FieldPathElem = {
 // readability. In practice, this means that the argument pattern of an enum
 // variant pattern has the same restriction as a function argument pattern.
 //
-// The flavour parameter `Flavour` can either be `"restricted"`, which is
-// disabling the non-parenthesized enum variant rule, or any other string for
-// the general flavour. In practice we use "unrestricted".
+// ## `or` patterns
 //
-// ## Addendum: `or` patterns
-//
-// This parameter now extends to `or` patterns, which are also ambiguous when
-// used as function arguments. As `or` is a valid identifier, `fun x or y =>
-// ...` could be a function of 3 arguments `x`, `or` and `y` or of one argument
-// matching the pattern `(x or y)` (this isn't a valid or-pattern because the
-// bound variables are different in each or branch, but that's beside the point
-// - checking variable mismatches isn't the job of parsing rules).
+// The same ambiguity (and solution) extends to `or` patterns, which are also
+// ambiguous when used as function arguments. As we want `or` to remain a valid
+// identifier, `fun x or y => ...` could be a function of 3 arguments `x`, `or`
+// and `y`, or a function of one argument matching the pattern `(x or y)` (this
+// isn't a valid or-pattern because the bound variables are different in each or
+// branch, but that's beside the point - checking variables mismatches isn't the
+// job of parsing rules).
 //
 // We thus reuse the exact same idea in order to force or-patterns used at the
 // top-level of a function argument to be parenthesized.
+//
+// ## Or-patterns ambiguities
+//
+// Parsing `or`-patterns without ambiguity, while still allowing `or` to remain
+// a valid identifier including within patterns (as in `'Foo or`) requires
+// slightly more complex constraints.
+//
+// The first issue is parentheses: how to parse `x or y or z`? Here we take a
+// simple stance: patterns within an `or`-branch must be parenthesized. So, this
+// is parsed as a `or`-pattern `[x, y, z]`.
+//
+// The second, harder issue is that enum variant patterns might have a trailing
+// `or` identifier. That is, when seeing `'Foo or`, the parser doesn't know if
+// it should shift in the hope of seeing another pattern after the `or`, and
+// parsing the overall result as an `or`-pattern `['Foo, <another pattern]`, or
+// if it should reduce to the enum variant pattern `'Foo or` and continue.
+//
+// The trick to solve those kind of issues is to regroup the "common
+// prefixes" in a rules and disambiguate as late as possible. In this case, we
+// disallow enum tag patterns in an `or`-branch, so that `'Foo or` is always
+// parsed as an enum variant pattern. Then, if we see a `'Foo or` immediately
+// followed by another pattern, we reinterpret it as an enum tag pattern
+// (although it has been parsed as a enum variant pattern) followed by an "or"
+// and the other pattern.
+//
+// There are other minor details, but with enough variants of pattern rules, we
+// can ensure there's only one way to parse each and every combination with only
+// one look-ahead.
 #[inline]
-PatternF<Flavour>: Pattern = {
-    <l: @L> <alias:(<Ident> "@")?> <data: PatternDataF<Flavour>> <r: @R> => {
+PatternF<EnumRule, OrRule, IdentRule>: Pattern = {
+    <l: @L>
+      <alias:(<Ident> "@")?> <data: PatternDataF<EnumRule, OrRule, IdentRule>>
+    <r: @R> => {
         Pattern {
            alias,
            data,
@@ -574,23 +609,52 @@ PatternF<Flavour>: Pattern = {
 };
 
 #[inline]
-PatternDataF<Flavour>: PatternData = {
+PatternDataF<EnumRule, OrRule, IdentRule>: PatternData = {
     RecordPattern => PatternData::Record(<>),
     ArrayPattern => PatternData::Array(<>),
     ConstantPattern => PatternData::Constant(<>),
-    EnumPatternF<Flavour> => PatternData::Enum(<>),
-    OrPatternF<Flavour> => PatternData::Or(<>),
-    Ident => PatternData::Any(<>),
+    EnumRule => PatternData::Enum(<>),
+    OrRule => PatternData::Any(<>),
+    //EnumPatternF<EnumFlavour, EnumParensFlavour> => PatternData::Enum(<>),
+    //OrPatternF<OrFlavour> => PatternData::Or(<>),
+    IdentRule => PatternData::Any(<>),
     "_" => PatternData::Wildcard,
 };
 
-// A general pattern.
+// A general pattern, unrestricted.
 #[inline]
-Pattern: Pattern = PatternF<"unrestricted">;
+Pattern: Pattern = PatternF<EnumPattern, OrPattern, Ident>;
 
 // A pattern restricted to function arguments.
 #[inline]
-PatternFun: Pattern = PatternF<"restricted">;
+PatternFun: Pattern = PatternF<EnumPatternParens, OrPatternParens, Ident>;
+
+// A pattern that can be used within a branch of an `or`-pattern. To avoid a
+// shift-reduce conflict (because we want to allow `or` to remain a valid
+// identifier, even inside patterns), this pattern has the following
+// restrictions:
+//
+// 1. Enum tag patterns are forbidden (something like `'Foo or 'Bar` is instead
+//   handled by first parsing `'Foo or` as an enum variant pattern, and then doing
+//   some magic - see the `OrPatternBranch` rule.
+// 2. Enum variant patterns shouldn't have the "or" identifier as an argument.
+//  Same thing: to avoid shift-reduce conflict, we need to forbid "or" as a
+//  trailing identifier for any pattern. The enum variant pattern is the only
+//  one that can have a trailing identifier (the argument), so we restrict it.
+// 3. Or-pattern must be parenthesized when nested in another or-pattern, to
+//  avoid the usual associativity ambiguity around `1 or 2 or 3`.
+// 4. Alias are forbidden at the top-level.
+#[inline]
+PatternOrBranch: Pattern =
+    <left: @L>
+      <data: PatternDataF<EnumPatternOrBranch, OrPatternParens, Ident>>
+    <right: @R> => {
+        Pattern {
+           alias: None,
+           data,
+           pos: mk_pos(src_id, left, right),
+        }
+    };
 
 ConstantPattern: ConstantPattern = {
     <start: @L> <data: ConstantPatternData> <end: @R> => ConstantPattern {
@@ -662,52 +726,122 @@ ArrayPattern: ArrayPattern = {
     },
 };
 
-EnumPatternF<Flavour>: EnumPattern = {
-    <start: @L> <tag: EnumTag> <end: @R> => EnumPattern {
-        tag,
-        pattern: None,
-        pos: mk_pos(src_id, start, end),
-    },
-    // See documentation of PatternF to see why we use the "restricted" variant
-    // here.
-    <start: @L> <tag: EnumTag> <pattern: PatternF<"restricted">> <end: @R>
-        if Flavour != "restricted" => EnumPattern {
+// A pattern for an enum tag (without argument).
+EnumTagPattern: EnumPattern = <start: @L> <tag: EnumTag> <end: @R> => EnumPattern {
+    tag,
+    pattern: None,
+    pos: mk_pos(src_id, start, end),
+};
+
+// A pattern for an enum variant (with an argument). The rule is parametrized by
+// the rule for identifiers, because when used in an `or`-pattern branch, we
+// need to restrict an identifier appearing as an argument to not be "or".
+EnumVariantPatternF<IdentRule>: EnumPattern =
+    // We require the argument pattern to be parenthesized if it's an enum
+    // variant pattern as well, as explained in the documentation of the
+    // `PatternF` rule.
+    <start: @L>
+      <tag: EnumTag>
+      <pattern: PatternF<EnumPatternParens, OrPattern, IdentRule>>
+      <end: @R> => EnumPattern {
         tag,
         pattern: Some(Box::new(pattern)),
         pos: mk_pos(src_id, start, end),
-    },
-    <start: @L> "(" <tag: EnumTag> <pattern: PatternF<"restricted">> ")" <end: @R> => EnumPattern {
-        tag,
-        pattern: Some(Box::new(pattern)),
-        pos: mk_pos(src_id, start, end),
+    };
+
+// A normal (unrestricted) enum variant pattern, where "or" can be used as
+// pattern for the argument.
+#[inline]
+EnumVariantPattern: EnumPattern = EnumVariantPatternF<Ident>;
+
+// An un-parenthesized enum pattern (including both enum tags and enum
+// variants).
+EnumPatternUnparens: EnumPattern = {
+    EnumTagPattern,
+    EnumVariantPattern,
+};
+
+// A parenthesized enum pattern, including both tags and variants (note that an
+// enum tag alone is never parenthesized: parentheses only applies to enum
+// variant patterns).
+EnumPatternParens: EnumPattern = {
+    EnumTagPattern,
+    "(" <EnumVariantPattern> ")",
+}
+
+// A twisted version of EnumPattern made specifically for the branch of an or
+// pattern. The additional restrictions are detailed in the description of the
+// `PatternOrBranch` rule.
+EnumPatternOrBranch: EnumPattern = {
+    EnumVariantPatternF<RestrictedIdent>,
+    // Only a top-level un-parenthesized enum variant pattern can be ambiguous.
+    // If it's parenthesized, we allow the general version including the "or"
+    // identifier
+    "(" <EnumVariantPattern> ")",
+};
+
+// The unrestricted rule of enum patterns. Allows both enum tags and enum
+// variants, and both parenthesized and un-parenthesized enum variants.
+EnumPattern: EnumPattern = {
+    EnumTagPattern,
+    EnumVariantPattern,
+    "(" <EnumVariantPattern> ")"
+};
+
+// An individual element of an or-pattern, plus a trailing "or". This rule is a
+// bit artificial, and is essentially here to dispel the shift/reduce conflict
+// around `'Foo or`/`'Foo or 'Bar` explained in the description of `PatternF`.
+//
+// This rule abstracts away the hack for parsing `'Foo or 'Bar` as `<'Foo or>
+// 'Bar` first (which doesn't make sense but removes the conflict by removing
+// the possibility of parsing it as `<'Foo> or <'Bar>`).
+OrPatternBranch: Pattern = {
+    // To avoid various shift-reduce conflicts, the patterns used within an
+    // `or`-branch have several restrictions. See the `PatternOrBranch` rule. 
+    PatternOrBranch,
+    // A variant pattern of the form `'<Tag> or`. The trick is to instead
+    // consider it as the enum tag pattern `'<Tag>` followed by the `or`
+    // contextual keyword after-the-fact.
+    <pat: EnumVariantPatternF<IdentOr>> => {
+        let pos = pat.pos;
+
+        Pattern {
+            pos,
+            data: PatternData::EnumPattern {
+                tag: pat.tag,
+                pattern: None,
+                pos,
+            },
+        }
+    }
+};
+
+// Unrestricted or-pattern. Allows un-parenthesized sequence of `or`-ed
+// patterns.
+OrPatternUnparens: OrPattern = {
+    <start: @L>
+      <patterns: OrPatternBranch+>
+      <last: PatternF<EnumPattern, OrPatternParens, Ident>>
+    <end: @R> => {
+        let patterns =
+          patterns.into_iter().chain(std::iter::once(last)).collect();
+
+        OrPattern {
+            patterns,
+            pos: mk_pos(src_id, start, end),
+        }
     },
 };
 
-OrPatternF<Flavour>: OrPattern = {
-    // We use the restricted version of the pattern rule for subpatterns here.
-    // The idea is to avoid ambiguities: for example, without restriction, `<p>
-    // or <q> or <r>` could be parsed either as `Or[Or[<p,<q>],<r>]`, `Or[<p>,
-    // Or[<q>,<r>]]`, or `Or[<p>, <q>, <r>]`. Secondly, this also doesn't play
-    // very well with unparenthesized enum patterns [TODO: not exactly true].
-    <start: @L> <fst: PatternF<"restricted">>
-      <patterns: ("or" <PatternF<"restricted">>)+> <end: @R>
-      if Flavour != "restricted" => {
-        let patterns = std::iter::once(fst).chain(patterns).collect();
+// Parenthesized `or`-pattern.
+OrPatternParens: OrPattern = {
+    "(" <OrPatternUnparens> ")",
+};
 
-        OrPattern {
-            patterns,
-            pos: mk_pos(src_id, start, end),
-        }
-    },
-    "(" <start: @L> <fst: PatternF<"restricted">>
-      <patterns: ("or" <PatternF<"restricted">>)+> <end: @R> ")" => {
-        let patterns = std::iter::once(fst).chain(patterns).collect();
-
-        OrPattern {
-            patterns,
-            pos: mk_pos(src_id, start, end),
-        }
-    },
+// General or-pattern, which can be parenthesized or not.
+OrPattern: OrPattern = {
+    OrPatternUnparens,
+    OrPatternParens,
 }
 
 // A binding `ident = <pattern>` inside a record pattern.
@@ -773,16 +907,24 @@ ExtendedIdent: LocIdent = {
     <Ident>,
 };
 
+
+// "or" contextual keyword when used as an ident.
+IdentOr: LocIdent = <left: @L> "or" <right: @R> =>
+    LocIdent::new_with_pos("or", mk_pos(src_id, left, right));
+
 // Tokens that must be lexed separately because they are keywords in some
 // specific contexts, but aren't ambiguous otherwise, and can in particular be
-// used as identifiers without any issue.
+// used as identifiers most of the time without any issue.
 ContextualKeyword: LocIdent = {
-    <left: @L> "or" <right: @R> => LocIdent::new_with_pos("or", mk_pos(src_id, left, right)),
+    IdentOr,
 };
 
+// The set of pure identifiers, which are never keywords in any context.
+RestrictedIdent: LocIdent = <left :@L> <id: "identifier"> <right :@R> =>
+    LocIdent::new_with_pos(id, mk_pos(src_id, left, right));
+
 Ident: LocIdent = {
-    <left :@L> <id: "identifier"> <right :@R> =>
-        LocIdent::new_with_pos(id, mk_pos(src_id, left, right)),
+    <RestrictedIdent>,
     <ContextualKeyword>,
 };
 
