@@ -123,7 +123,7 @@ pub enum NormalToken<'input> {
     False,
     /// Or isn't a reserved keyword. It is a contextual keyword (a keyword that can be used as an
     /// identifier because it's not ambiguous but) within patterns.
-    #[token("or")]
+    #[token("%or%")]
     Or,
 
     #[token("?")]

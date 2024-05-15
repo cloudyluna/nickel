@@ -596,9 +596,9 @@ FieldPathElem: FieldPathElem = {
 // can ensure there's only one way to parse each and every combination with only
 // one look-ahead.
 #[inline]
-PatternF<EnumRule, OrRule, IdentRule>: Pattern = {
+PatternF<EnumRule, OrRule>: Pattern = {
     <l: @L>
-      <alias:(<Ident> "@")?> <data: PatternDataF<EnumRule, OrRule, IdentRule>>
+      <alias:(<WithPos<Ident>> "@")?> <data: PatternDataF<EnumRule, OrRule>>
     <r: @R> => {
         Pattern {
            alias,
@@ -609,25 +609,23 @@ PatternF<EnumRule, OrRule, IdentRule>: Pattern = {
 };
 
 #[inline]
-PatternDataF<EnumRule, OrRule, IdentRule>: PatternData = {
+PatternDataF<EnumRule, OrRule>: PatternData = {
     RecordPattern => PatternData::Record(<>),
     ArrayPattern => PatternData::Array(<>),
     ConstantPattern => PatternData::Constant(<>),
     EnumRule => PatternData::Enum(<>),
     OrRule => PatternData::Any(<>),
-    //EnumPatternF<EnumFlavour, EnumParensFlavour> => PatternData::Enum(<>),
-    //OrPatternF<OrFlavour> => PatternData::Or(<>),
-    IdentRule => PatternData::Any(<>),
+    Ident => PatternData::Any(<>),
     "_" => PatternData::Wildcard,
 };
 
 // A general pattern, unrestricted.
 #[inline]
-Pattern: Pattern = PatternF<EnumPattern, OrPattern, Ident>;
+Pattern: Pattern = PatternF<EnumPattern, OrPattern>;
 
 // A pattern restricted to function arguments.
 #[inline]
-PatternFun: Pattern = PatternF<EnumPatternParens, OrPatternParens, Ident>;
+PatternFun: Pattern = PatternF<EnumPatternParens, OrPatternParens>;
 
 // A pattern that can be used within a branch of an `or`-pattern. To avoid a
 // shift-reduce conflict (because we want to allow `or` to remain a valid
@@ -647,7 +645,7 @@ PatternFun: Pattern = PatternF<EnumPatternParens, OrPatternParens, Ident>;
 #[inline]
 PatternOrBranch: Pattern =
     <left: @L>
-      <data: PatternDataF<EnumPatternOrBranch, OrPatternParens, Ident>>
+      <data: PatternDataF<EnumPatternParens, OrPatternParens>>
     <right: @R> => {
         Pattern {
            alias: None,
@@ -733,26 +731,19 @@ EnumTagPattern: EnumPattern = <start: @L> <tag: EnumTag> <end: @R> => EnumPatter
     pos: mk_pos(src_id, start, end),
 };
 
-// A pattern for an enum variant (with an argument). The rule is parametrized by
-// the rule for identifiers, because when used in an `or`-pattern branch, we
-// need to restrict an identifier appearing as an argument to not be "or".
-EnumVariantPatternF<IdentRule>: EnumPattern =
+// A pattern for an enum variant (with an argument).
+EnumVariantPattern: EnumPattern =
     // We require the argument pattern to be parenthesized if it's an enum
     // variant pattern as well, as explained in the documentation of the
     // `PatternF` rule.
     <start: @L>
       <tag: EnumTag>
-      <pattern: PatternF<EnumPatternParens, OrPattern, IdentRule>>
+      <pattern: PatternF<EnumPatternParens, OrPatternParens>>
       <end: @R> => EnumPattern {
         tag,
         pattern: Some(Box::new(pattern)),
         pos: mk_pos(src_id, start, end),
     };
-
-// A normal (unrestricted) enum variant pattern, where "or" can be used as
-// pattern for the argument.
-#[inline]
-EnumVariantPattern: EnumPattern = EnumVariantPatternF<Ident>;
 
 // An un-parenthesized enum pattern (including both enum tags and enum
 // variants).
@@ -769,17 +760,6 @@ EnumPatternParens: EnumPattern = {
     "(" <EnumVariantPattern> ")",
 }
 
-// A twisted version of EnumPattern made specifically for the branch of an or
-// pattern. The additional restrictions are detailed in the description of the
-// `PatternOrBranch` rule.
-EnumPatternOrBranch: EnumPattern = {
-    EnumVariantPatternF<RestrictedIdent>,
-    // Only a top-level un-parenthesized enum variant pattern can be ambiguous.
-    // If it's parenthesized, we allow the general version including the "or"
-    // identifier
-    "(" <EnumVariantPattern> ")",
-};
-
 // The unrestricted rule of enum patterns. Allows both enum tags and enum
 // variants, and both parenthesized and un-parenthesized enum variants.
 EnumPattern: EnumPattern = {
@@ -788,43 +768,15 @@ EnumPattern: EnumPattern = {
     "(" <EnumVariantPattern> ")"
 };
 
-// An individual element of an or-pattern, plus a trailing "or". This rule is a
-// bit artificial, and is essentially here to dispel the shift/reduce conflict
-// around `'Foo or`/`'Foo or 'Bar` explained in the description of `PatternF`.
-//
-// This rule abstracts away the hack for parsing `'Foo or 'Bar` as `<'Foo or>
-// 'Bar` first (which doesn't make sense but removes the conflict by removing
-// the possibility of parsing it as `<'Foo> or <'Bar>`).
-OrPatternBranch: Pattern = {
-    // To avoid various shift-reduce conflicts, the patterns used within an
-    // `or`-branch have several restrictions. See the `PatternOrBranch` rule. 
-    PatternOrBranch,
-    // A variant pattern of the form `'<Tag> or`. The trick is to instead
-    // consider it as the enum tag pattern `'<Tag>` followed by the `or`
-    // contextual keyword after-the-fact.
-    <pat: EnumVariantPatternF<IdentOr>> => {
-        let pos = pat.pos;
-
-        Pattern {
-            pos,
-            data: PatternData::EnumPattern {
-                tag: pat.tag,
-                pattern: None,
-                pos,
-            },
-        }
-    }
-};
-
 // Unrestricted or-pattern. Allows un-parenthesized sequence of `or`-ed
 // patterns.
 OrPatternUnparens: OrPattern = {
     <start: @L>
-      <patterns: OrPatternBranch+>
-      <last: PatternF<EnumPattern, OrPatternParens, Ident>>
+      <first: PatternOrBranch>
+      <patterns: ("or" <PatternOrBranch>)+>
     <end: @R> => {
         let patterns =
-          patterns.into_iter().chain(std::iter::once(last)).collect();
+          std::iter::once(first).chain(patterns).collect();
 
         OrPattern {
             patterns,
@@ -903,30 +855,26 @@ MetadataKeyword: LocIdent = {
 //
 // Thus, for fields, ExtendedIdent is use in place of Ident.
 ExtendedIdent: LocIdent = {
-    <WithPos<MetadataKeyword>>,
-    <Ident>,
+    WithPos<MetadataKeyword>,
+    Ident,
 };
-
-
-// "or" contextual keyword when used as an ident.
-IdentOr: LocIdent = <left: @L> "or" <right: @R> =>
-    LocIdent::new_with_pos("or", mk_pos(src_id, left, right));
 
 // Tokens that must be lexed separately because they are keywords in some
 // specific contexts, but aren't ambiguous otherwise, and can in particular be
 // used as identifiers most of the time without any issue.
-ContextualKeyword: LocIdent = {
-    IdentOr,
-};
+//ContextualKeyword: LocIdent = {
+//    "or" => LocIdent::new("or"),
+//};
 
 // The set of pure identifiers, which are never keywords in any context.
-RestrictedIdent: LocIdent = <left :@L> <id: "identifier"> <right :@R> =>
-    LocIdent::new_with_pos(id, mk_pos(src_id, left, right));
+RestrictedIdent: LocIdent = <id: "identifier"> => LocIdent::new(id);
 
-Ident: LocIdent = {
-    <RestrictedIdent>,
-    <ContextualKeyword>,
-};
+Ident: LocIdent = RestrictedIdent;
+
+//Ident: LocIdent = {
+//    WithPos<RestrictedIdent>,
+//    WithPos<ContextualKeyword>,
+//};
 
 Bool: bool = {
     "true" => true,
